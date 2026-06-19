@@ -103,6 +103,7 @@
             :predefined="actionButton.predefined"
             :key="buttonIndex"
           ></ActionButton>
+          <BatchToggleButton></BatchToggleButton>
         </div>
       </v-app-bar>
       <v-navigation-drawer
@@ -135,11 +136,20 @@
       </v-navigation-drawer>
 
       <ContrastPanel
+        v-if="!isBatchMode"
         :style="[area, transparentArea]"
         v-bind:class="{ active: drawer, 'rounded-panel': true }"
         @mouseover.native="penerate(true)"
         @mouseleave.native="penerate(false)"
       ></ContrastPanel>
+      <BatchPanel
+        v-else
+        ref="batchPanelRef"
+        :style="[area, transparentArea]"
+        v-bind:class="{ active: drawer, 'rounded-panel': true }"
+        @mouseover.native="penerate(true)"
+        @mouseleave.native="penerate(false)"
+      ></BatchPanel>
     </v-app>
   </div>
 </template>
@@ -166,6 +176,10 @@ import EngineButton from "../components/EngineButton.vue";
 import { dictionaryTypes, DictionaryType } from "../common/dictionary/types";
 import "@/css/shared-styles.css";
 
+import BatchToggleButton from "../batch/BatchToggleButton.vue";
+import BatchPanel from "../batch/BatchPanel.vue";
+import { batchStore } from "../batch/batchStore";
+
 function sliceArray<T>(arr: T[], size: number) {
   var arr2 = [];
   for (var i = 0; i < arr.length; i = i + size) {
@@ -181,6 +195,8 @@ function sliceArray<T>(arr: T[], size: number) {
     EngineButton,
     ActionButton,
     Tips,
+    BatchToggleButton,
+    BatchPanel,
   },
 })
 export default class Contrast extends Mixins(BaseView, WindowController) {
@@ -215,6 +231,11 @@ export default class Contrast extends Mixins(BaseView, WindowController) {
 
   dialog: boolean = false;
   marginBottom: number = 5;
+  batchUnsubscribe: (() => void) | null = null;
+
+  get isBatchMode(): boolean {
+    return batchStore.getState().isBatchMode;
+  }
 
   get valid() {
     return (
@@ -239,6 +260,15 @@ export default class Contrast extends Mixins(BaseView, WindowController) {
 
   mounted() {
     if (!this.config.neverShowTips) this.dialog = true;
+    this.batchUnsubscribe = batchStore.subscribe(() => {
+      this.$forceUpdate();
+    });
+  }
+
+  beforeDestroy() {
+    if (this.batchUnsubscribe) {
+      this.batchUnsubscribe();
+    }
   }
 
 
