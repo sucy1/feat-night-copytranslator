@@ -3,8 +3,8 @@ import { BatchParagraph, BatchStatus } from "./types";
 import eventBus from "@/common/event-bus";
 import logger from "@/common/logger";
 import { TranslateResult } from "@/common/translate/types";
-import { getTranslator } from "@/common/translate/translators";
 import { Language } from "@/common/translate/types";
+import { clipboard } from "electron";
 
 type TranslateOptions = {
   engine?: string;
@@ -17,6 +17,10 @@ class BatchService {
     string,
     { resolve: (res: TranslateResult) => void; reject: (err: any) => void }
   > = new Map();
+
+  private clipboardWatcher: number | null = null;
+  private lastClipboardText: string = "";
+  private isListeningClipboard: boolean = false;
 
   constructor() {
     this.bindEventListeners();
@@ -40,6 +44,76 @@ class BatchService {
     });
   }
 
+  startClipboardListener(): void {
+    if (this.isListeningClipboard) return;
+    this.isListeningClipboard = true;
+    this.lastClipboardText = clipboard.readText() || "";
+
+    this.clipboardWatcher = window.setInterval(() => {
+      try {
+        const currentText = clipboard.readText();
+        if (currentText && currentText !== this.lastClipboardText) {
+          const trimmed = currentText.trim();
+          if (trimmed && trimmed.length > 0) {
+            const state = batchStore.getState();
+            const exists = state.paragraphs.some((p) => p.original === trimmed);
+            if (!exists) {
+              batchStore.addParagraph(trimmed);
+              logger.toast("已添加到批量列表");
+            }
+          }
+          this.lastClipboardText = currentText;
+        }
+      } catch (e) {
+        logger.error("Clipboard watcher error:", e);
+      }
+    }, 800);
+  }
+
+  stopClipboardListener(): void {
+    if (this.clipboardWatcher) {
+      clearInterval(this.clipboardWatcher);
+      this.clipboardWatcher = null;
+    }
+    this.isListeningClipboard = false;
+  }
+
+  toggleClipboardListener(): boolean {
+    if (this.isListeningClipboard) {
+      this.stopClipboardListener();
+      return false;
+    } else {
+      this.startClipboardListener();
+      return true;
+    }
+  }
+
+  get clipboardListening(): boolean {
+    return this.isListeningClipboard;
+  }
+
+  splitAndAddParagraphs(text: string): number {
+    const paragraphs = text
+      .split(/\n\s*\n/)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+
+    let addedCount = 0;
+    paragraphs.forEach((para) => {
+      const state = batchStore.getState();
+      const exists = state.paragraphs.some((p) => p.original === para);
+      if (!exists) {
+        batchStore.addParagraph(para);
+        addedCount++;
+      }
+    });
+
+    if (addedCount > 0) {
+      logger.toast(`已添加 ${addedCount} 段文本`);
+    }
+    return addedCount;
+  }
+
   private async translateSingle(
     text: string,
     options: TranslateOptions = {}
@@ -50,19 +124,24 @@ class BatchService {
     const to = options.to || "zh-CN";
 
     return new Promise<TranslateResult>((resolve, reject) => {
-      this.pendingRequests.set(requestId, { resolve, reject });
-
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         reject(new Error("Translation timeout"));
       }, 30000);
 
-      const originalResolve = resolve;
       const wrappedResolve = (res: TranslateResult) => {
         clearTimeout(timeout);
-        originalResolve(res);
+        this.pendingRequests.delete(requestId);
+        resolve(res);
       };
-      this.pendingRequests.set(requestId, { resolve: wrappedResolve, reject });
+
+      const wrappedReject = (err: any) => {
+        clearTimeout(timeout);
+        this.pendingRequests.delete(requestId);
+        reject(err);
+      };
+
+      this.pendingRequests.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
         eventBus.at("dispatch", "testTranslate", {
@@ -73,8 +152,8 @@ class BatchService {
           to,
         });
       } catch (e) {
-        clearTimeout(timeout);
         this.pendingRequests.delete(requestId);
+        clearTimeout(timeout);
         reject(e);
       }
     });
@@ -119,18 +198,20 @@ class BatchService {
     }
 
     batchStore.setGlobalStatus("translating");
-    pendingParagraphs.forEach((p) =>
-      batchStore.updateParagraph(p.id, { status: "translating" })
-    );
 
     let hasError = false;
+    let completedCount = 0;
 
     for (let i = 0; i < pendingParagraphs.length; i += concurrency) {
       const chunk = pendingParagraphs.slice(i, i + concurrency);
       const promises = chunk.map((p) =>
-        this.translateParagraph(p, options).catch(() => {
-          hasError = true;
-        })
+        this.translateParagraph(p, options)
+          .then(() => {
+            completedCount++;
+          })
+          .catch(() => {
+            hasError = true;
+          })
       );
       await Promise.all(promises);
     }
@@ -145,8 +226,19 @@ class BatchService {
     if (allCompleted) {
       logger.toast(`批量翻译完成，共 ${finalState.paragraphs.length} 段`);
     } else if (hasError) {
-      logger.toast("部分段落翻译失败");
+      const errorCount = finalState.paragraphs.filter((p) => p.status === "error").length;
+      logger.toast(`翻译完成，${errorCount} 段失败`);
     }
+  }
+
+  public retryFailed(): Promise<void> {
+    const state = batchStore.getState();
+    const failed = state.paragraphs.filter((p) => p.status === "error");
+    if (failed.length === 0) {
+      logger.toast("没有失败的段落");
+      return Promise.resolve();
+    }
+    return this.translateAll();
   }
 
   public getCompletedCount(): number {
@@ -160,6 +252,30 @@ class BatchService {
       .getState()
       .paragraphs.filter((p) => p.status === "idle" || p.status === "translating")
       .length;
+  }
+
+  public getErrorCount(): number {
+    return batchStore
+      .getState()
+      .paragraphs.filter((p) => p.status === "error").length;
+  }
+
+  public copyAllTranslations(): string {
+    const translated = batchStore
+      .getState()
+      .paragraphs.filter((p) => p.status === "completed" && p.translation);
+
+    if (translated.length === 0) {
+      return "";
+    }
+
+    const text = translated
+      .map((p) => p.translation)
+      .join("\n\n");
+
+    clipboard.writeText(text);
+    logger.toast(`已复制 ${translated.length} 段译文`);
+    return text;
   }
 }
 
